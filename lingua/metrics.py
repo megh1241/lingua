@@ -152,8 +152,8 @@ class GPUMemoryMonitor:
 
         num_retries = cuda_info["num_alloc_retries"]
         num_ooms = cuda_info["num_ooms"]
-        power_draw = torch.cuda.power_draw()
-
+        #power_draw = torch.cuda.power_draw()
+        power_draw = 1
         if num_retries > 0:
             logger.warning(f"{num_retries} CUDA memory allocation retries.")
         if num_ooms > 0:

@@ -14,8 +14,8 @@ def run_command(command):
 
 def download_dataset(repo_id, local_dir, allow_patterns):
     print(f"Downloading dataset from {repo_id}...")
-    max_retries = 5
-    retry_delay = 10  # seconds
+    max_retries = 25
+    retry_delay = 20  # seconds
     for attempt in range(max_retries):
         try:
             snapshot_download(
@@ -24,7 +24,9 @@ def download_dataset(repo_id, local_dir, allow_patterns):
                 local_dir=local_dir,
                 allow_patterns=allow_patterns,
                 resume_download=True,
-                max_workers=16, # Don't hesitate to increase this number to lower the download time
+                #force_download=True,
+                
+                max_workers=64, # Don't hesitate to increase this number to lower the download time
             )
             break
         except requests.exceptions.ReadTimeout:
@@ -113,7 +115,7 @@ def main(dataset, memory, data_dir, seed=42, nchunks=32):
     terashuf_dir = setup_terashuf(work_dir)
 
     # Download dataset
-    download_dataset(repo_id, src_dir, allow_patterns)
+    #download_dataset(repo_id, src_dir, allow_patterns)
 
     if "fineweb" in dataset:
         parquet_to_jsonl(dataset, work_dir, src_dir, src_dir)
@@ -145,7 +147,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=str)
     parser.add_argument("memory", type=float, default=8)
-    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--data_dir", type=str, default="/fsx-checkpoints/meghanam/data")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nchunks", type=int, default=32)
 

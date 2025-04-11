@@ -3,9 +3,9 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Union, Tuple
-
+import os
 import torch
-from torch import nn
+from torch import nn, autograd
 from torch.nn import functional as F
 from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
@@ -13,11 +13,52 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
     _mask_mod_signature,
 )
+import xformers.ops as xops
+import xformers.ops.sp24 as sp24
 
 from lingua import probe
+#from lingua import sparse_ops
+#from sparse_ops import FP8SparseLinear
+
+
+import numpy as np
+
+from torch.cuda.amp import custom_fwd, custom_bwd
+
+from sparse import matmul, MVUE24_approx_triton, soft_threshold24_triton
+
 
 flex_attention_comp = torch.compile(flex_attention)
 
+_24_WARMUP_ITERS = int(os.environ.get("WARMUP_ITERS_24", "62000"))
+_24_WARMUP = False
+
+_WSPARSIFY1 = False
+_WSPARSIFY2 = False
+_SP_RATIO = 0.95
+_SHUFFLE_ROWS = True
+_ACTIVATION_SPARSE = False
+
+
+def check_24_row( a):
+    num_eles = a.size
+    for i in range(0, num_eles-4, 4):
+        subset_a = a[i:i+4]
+        num_zeros = np.count_nonzero(subset_a == 0)
+        if num_zeros < 2:
+            return False
+    return True
+
+def check_24(t):
+    is_24 = True
+    with torch.no_grad():
+        a = t.detach().cpu()
+        a = a.to(torch.float32).numpy()
+        for i in range(a.shape[0]):
+            is_24 = is_24 and check_24_row(a[i,:])
+            if not is_24:
+                return is_24
+    return is_24
 
 class InitStdFactor(Enum):
     DISABLED = "disabled"  # Init std is divided by 1.0
@@ -44,9 +85,11 @@ class BaseTransformerArgs:
 
     init_base_std: Optional[float] = None
     init_std_factor: str = "disabled"
-
+    activation_fn: str = "sqrelu"
+    wsparsify1: bool = True
+    wsparsify2: bool = True
+    activation_sparsify: bool = False
     max_seqlen: int = 1024
-
 
 def cross_entropy(pred, target, **kwargs):
     return F.nll_loss(
@@ -428,7 +471,113 @@ class Attention(nn.Module):
         )
 
 
-class FeedForward(nn.Module):
+
+class SoftThreshold(autograd.Function):
+    @staticmethod
+    def forward(ctx, weight, scale):
+        weight_temp = weight.detach()
+        weight_sparse, _ = soft_threshold24_triton(weight_temp)
+        return weight_sparse * scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
+def get_dense_and_sparse_indices(act: torch.Tensor, sparse_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert act.ndim == 2
+    sparse_level = (act <= 0).mean(0, dtype=torch.float32)
+    sparse_sorted = sparse_level.argsort(descending=True)
+    first_dense = int(sparse_ratio * sparse_sorted.shape[0])
+    first_dense = (int((first_dense - 1) // 128) + 1) * 128
+
+    idx_d = sparse_sorted[first_dense:]
+    idx_sp = sparse_sorted[:first_dense]
+    return idx_d, idx_sp
+
+
+def sp24_dense(x: torch.Tensor, algo="largest_abs") -> torch.Tensor:
+    from xformers.ops import sp24
+
+    assert algo in ["largest", "largest_abs"]
+
+    # Also important for evals: we don't want to do sparsity
+    # (otherwise would need to pad probably?)
+    if _24_WARMUP or not _ACTIVATION_SPARSE:
+        return x
+    return torch.ops.xformers.sparseNM_dense(x, N=2, M=4, sort_preproc=algo)
+
+def dense_and_sp_mm(a: torch.Tensor, b: torch.Tensor, idx_d: torch.Tensor, idx_sp: torch.Tensor) -> torch.Tensor:
+    m, n, k = a.shape[0], b.shape[1], a.shape[1]
+    assert a.shape == (m, k)
+    assert b.shape == (k, n)
+    assert idx_d.shape[0] + idx_sp.shape[0] == m, f"{idx_d.shape[0]} + {idx_sp.shape[0]} != {m}"
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    out[idx_d] = a[idx_d] @ b
+    out[idx_sp] = sp24_dense(a[idx_sp]) @ b
+    return out
+
+class _FFNSRelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w1, w2):
+        """sparse"""
+        # linear
+        w1 = w1.T
+        y1 = x @ w1
+        y1 = sp24_dense(y1, "largest")
+        y2 = F.relu(y1) ** 2
+        y3 = y2.view_as(y2) @ w2
+        ctx.save_for_backward(x, w1, w2, y1)
+        return y3
+
+    @staticmethod
+    def backward(ctx, dy3):
+        return _FFNSRelu.backward_sp(ctx, dy3 )
+
+    @staticmethod
+    def backward_sp(ctx, dy3):
+        """Sparse"""
+        x, w1, w2, y1 = ctx.saved_tensors
+        y2 = F.relu(y1) ** 2
+        idx_d, idx_sp = get_dense_and_sparse_indices(y1, sparse_ratio=_SP_RATIO)
+        # linear2
+        dy2 = dy3 @ w2.T # dense
+        dw2 = dense_and_sp_mm(y2.T, dy3, idx_d, idx_sp)
+        # relu
+        dy1 = 2 * dy2 * (F.relu(y1))
+        # linear1
+        dx = sp24_dense(dy1) @ w1.T # sparse
+        dw1 = dense_and_sp_mm(dy1.T, x, idx_d, idx_sp).T
+        return dx, dw1.T, dw2,  None
+
+    @staticmethod
+    def backward_dense(ctx, dy3):
+        """Dense"""
+        x, w1, w2, y1 = ctx.saved_tensors
+        # recompute
+        y2 = F.relu(y1) ** 2
+        # linear2
+        dy2 = dy3 @ w2.T
+        if _WSPARSIFY2:
+            dw2 = y2.T@MVUE24_approx_triton(dy3)
+        else:
+            dw2 = y2.T@dy3
+        # relu
+        dy1 = 2 * dy2 * (F.relu(y1))
+        # linear1
+        dx = dy1@w1.T
+        if _WSPARSIFY1:
+            dw1 = x.T@MVUE24_approx_triton(dy1)
+        else:
+            dw1 = x.T@dy1
+        assert dx.shape == x.shape
+        assert dw1.shape == w1.shape
+        assert dw2.shape == w2.shape
+        return dx, dw1, dw2
+
+
+
+class FeedForwardSRelu(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -436,54 +585,98 @@ class FeedForward(nn.Module):
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
         mp_size: int = 1,
-    ):
+        activation_fn: str = 'sqrelu',
+        
+        ):
         super().__init__()
-
-        hidden_dim = int(2 * hidden_dim / 3)
+        if _WSPARSIFY1:
+            self.register_buffer('scale1', torch.tensor(0.))
+        if _WSPARSIFY2:
+            self.register_buffer('scale2', torch.tensor(0.))
+ 
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         assert hidden_dim % mp_size == 0
 
+        self.activation_fn = activation_fn
         self.dim = dim
         self.hidden_dim = hidden_dim
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
 
-        self.w1 = nn.Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-        )
-        self.w3 = nn.Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-        )
         self.w2 = nn.Linear(
-            hidden_dim,
-            dim,
-            bias=False,
+                hidden_dim,
+                dim,
+                bias=False,
         )
+  
+
+    def get_sparse_weights_w1(self):
+        return SoftThreshold.apply(self.w1.weight, self.scale1)
+    
+    def get_sparse_weights_w2(self):
+        return SoftThreshold.apply(self.w2.weight, self.scale2)
+
+    @torch.no_grad()
+    def _init_scale_w(self, w, obj_name = 'scale1'):
+        weight = w.cuda()
+        weight_temp = weight.detach()
+        weight_temp_full = weight_temp.full_tensor()
+        weight_sparse, _ = soft_threshold24_triton(weight_temp_full)
+        scale = torch.sum(torch.mul(torch.flatten(weight_temp_full),
+                    torch.flatten(weight_sparse))) / torch.sum(torch.mul(
+                torch.flatten(weight_sparse), torch.flatten(weight_sparse)))
+        if obj_name == 'scale1':
+            self.scale1.copy_(scale.cpu())
+        else:
+            self.scale2.copy_(scale.cpu())
+
+
+    @torch.no_grad()
+    def init_scale(self):
+        if _WSPARSIFY1:
+            self._init_scale_w(self.w1.weight, 'scale1')
+        if _WSPARSIFY2:
+            self._init_scale_w(self.w2.weight, 'scale2')
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # B S D
-        x1 = self.w1(x.view_as(x))
-        x3 = self.w3(x.view_as(x))
-        output = self.w2(F.silu(x1) * x3)
-        return output
-
+        orig_shape = x.shape
+        x = x.flatten(0, -2)
+        _SHUFFLE_ROWS=True
+        if _SHUFFLE_ROWS:
+            rp = torch.randperm(x.shape[0], device=x.device)
+            x = x[rp]
+        
+        w1 = self.w1.weight
+        w2 = self.w2.weight
+        if _WSPARSIFY1:
+            w1 = self.get_sparse_weights_w1()
+        if _WSPARSIFY2:
+            w2 = self.get_sparse_weights_w2()
+        out = out_permed = _FFNSRelu.apply(x, w1, w2.T)
+        
+        if _SHUFFLE_ROWS:
+            out = torch.empty_like(out_permed)
+            out[rp] = out_permed
+       
+        return out.reshape(orig_shape)
+    
+  
     def reset_parameters(self, init_std=None, factor=1.0):
         in_init_std = init_std or (self.dim ** (-0.5))
         out_init_std = init_std or (self.hidden_dim ** (-0.5))
         in_init_std = in_init_std
         out_init_std = out_init_std / factor
-        for w in [self.w1, self.w3]:
-            nn.init.trunc_normal_(
-                w.weight,
+ 
+        nn.init.trunc_normal_(
+                self.w1.weight,
                 mean=0.0,
                 std=in_init_std,
                 a=-3 * in_init_std,
                 b=3 * in_init_std,
             )
+
         nn.init.trunc_normal_(
             self.w2.weight,
             mean=0.0,
@@ -492,6 +685,82 @@ class FeedForward(nn.Module):
             b=3 * out_init_std,
         )
 
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+        mp_size: int = 1,
+        activation_fn: str = 'sqrelu',
+        ):
+        super().__init__()
+
+        if activation_fn != 'sqrelu':
+            hidden_dim = int(2 * hidden_dim / 3)
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        assert hidden_dim % mp_size == 0
+
+        self.activation_fn = activation_fn
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        if self.activation_fn != 'sqrelu':
+            self.w3 = nn.Linear(
+                dim,
+                hidden_dim,
+                bias=False,
+            )
+        self.w2 = nn.Linear(
+                hidden_dim,
+                dim,
+                bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # B S D
+        if self.activation_fn == 'sqrelu':
+            y1 = self.w1(x.view_as(x))
+            y2 = F.relu(y1) ** 2
+            return self.w2(y2.view_as(y2))
+        else:
+            x1 = self.w1(x.view_as(x))
+            x3 = self.w3(x.view_as(x))
+            return self.w2(F.silu(x1) * x3)
+        
+    def reset_parameters(self, init_std=None, factor=1.0):
+        in_init_std = init_std or (self.dim ** (-0.5))
+        out_init_std = init_std or (self.hidden_dim ** (-0.5))
+        in_init_std = in_init_std
+        out_init_std = out_init_std / factor
+        if self.activation_fn == 'sqrelu':
+            nn.init.trunc_normal_(
+                self.w1.weight,
+                mean=0.0,
+                std=in_init_std,
+                a=-3 * in_init_std,
+                b=3 * in_init_std,
+            )
+        else:
+            for w in [self.w1, self.w3]:
+                nn.init.trunc_normal_(
+                    w.weight,
+                    mean=0.0,
+                    std=in_init_std,
+                    a=-3 * in_init_std,
+                    b=3 * in_init_std,
+                )
+        nn.init.trunc_normal_(
+            self.w2.weight,
+            mean=0.0,
+            std=out_init_std,
+            a=-3 * out_init_std,
+            b=3 * out_init_std,
+        )
 
 class TransformerBlock(nn.Module):
     def __init__(self, args: BaseTransformerArgs):
@@ -514,12 +783,26 @@ class TransformerBlock(nn.Module):
             n_kv_heads=self.n_kv_heads,
             rope_theta=args.rope_theta,
         )
-        self.feed_forward = FeedForward(
-            dim=args.dim,
-            hidden_dim=4 * args.dim,
-            multiple_of=args.multiple_of,
-            ffn_dim_multiplier=args.ffn_dim_multiplier,
-        )
+        #Note: only set to True to do a sanity check.
+        #FeedForwardSRelu with wsparsify1, wsparsify2 and
+        #activation_sparsity set to false is equivalent to baseline.
+        baseline = False 
+        if baseline:
+            self.feed_forward = FeedForward(
+                dim=args.dim,
+                hidden_dim=4 * args.dim,
+                multiple_of=args.multiple_of,
+                ffn_dim_multiplier=args.ffn_dim_multiplier,
+                activation_fn=args.activation_fn,
+            )
+        else:
+            self.feed_forward = FeedForwardSRelu(
+                dim=args.dim,
+                hidden_dim=4 * args.dim,
+                multiple_of=args.multiple_of,
+                ffn_dim_multiplier=args.ffn_dim_multiplier,
+                activation_fn=args.activation_fn,
+            )
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -529,7 +812,7 @@ class TransformerBlock(nn.Module):
         freq_cis: torch.Tensor,
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
-        attn_impl: str = "sdpa",
+        attn_impl: str = "sdpa"
     ) -> torch.Tensor:
 
         h = x + self.attention(
@@ -540,6 +823,7 @@ class TransformerBlock(nn.Module):
             attn_impl=attn_impl,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
+
         return out
 
     def init_weights(self, init_std=None, factor=1.0):
@@ -548,7 +832,10 @@ class TransformerBlock(nn.Module):
 
         self.feed_forward.reset_parameters(init_std, factor)
         self.ffn_norm.reset_parameters()
-
+        
+        if _WSPARSIFY2 or _WSPARSIFY1:
+            self.feed_forward.init_scale()
+    
 
 class BaseTransformer(nn.Module):
     def __init__(self, args: BaseTransformerArgs):
@@ -563,9 +850,11 @@ class BaseTransformer(nn.Module):
             max_seqlen=args.max_seqlen,
         )
 
+
         self.layers = nn.ModuleList()
         for _ in range(args.n_layers):
             self.layers.append(TransformerBlock(args))
+
 
     def forward(
         self,
@@ -578,12 +867,14 @@ class BaseTransformer(nn.Module):
         freq_cis = self.rope_embeddings(seqlen=self.max_seqlen, tok_idx=tok_idx)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
+            h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask,
+                    attn_impl=attn_impl)
         return h
 
     def reset_parameters(self):
         # Either use fixed base std or sqrt model dim
         self.rope_embeddings.reset_parameters()
+
 
     def init_weights(self):
         self.reset_parameters()
@@ -594,5 +885,4 @@ class BaseTransformer(nn.Module):
                 InitStdFactor.DIM_RATIO: self.dim / 4096,
                 InitStdFactor.DISABLED: 1.0,
             }[self.init_std_factor]
-
             layer.init_weights(self.init_base_std, factor)

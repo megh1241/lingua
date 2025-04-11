@@ -122,7 +122,9 @@ class LMTransformer(BaseTransformer):
         # Either use fixed base std or sqrt model dim
         super().reset_parameters()
         init_std = init_std or (self.dim ** (-0.5))
+        
         self.norm.reset_parameters()
+        
         nn.init.trunc_normal_(
             self.tok_embeddings.weight,
             mean=0.0,

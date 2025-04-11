@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
 from copy import deepcopy
 import gc
 import logging
@@ -11,8 +10,9 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from functools import reduce
 import numpy as np
 from omegaconf import OmegaConf
 import torch
@@ -20,11 +20,14 @@ import torch.distributed
 import torch.nn.functional as F
 import xformers.profiler
 from torch.optim import lr_scheduler
+import lingua.transformer
+import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed._tensor import DTensor
 
 from lingua.args import dataclass_from_dict, dump_config, flatten_dict
 from lingua.checkpoint import CheckpointArgs, CheckpointManager, load_from_checkpoint
+
 from lingua.data import (
     DataArgs,
     PackTokensState,
@@ -46,6 +49,7 @@ from lingua.distributed import (
     requeue_slurm_job,
     check_model_value_range,
 )
+
 from lingua.logger import init_logger
 from lingua.metrics import (
     GPUMemoryMonitor,
@@ -64,12 +68,15 @@ from apps.main.transformer import (
     tp_parallelize,
     get_no_recompute_ops,
 )
-from lingua.probe import AutoProbeD
+#from lingua.probe import AutoProbeD
 from lingua.stool import StoolArgs, launch_job
 
 import wandb
 
 logger = logging.getLogger()
+
+_24_WARMUP_ITERS = int(os.environ.get("WARMUP_ITERS_24", "1000"))
+_24_WARMUP = True
 
 
 @dataclass
@@ -88,6 +95,7 @@ class TrainArgs:
 
     # Nb optimizer steps to take
     steps: int = 1000
+
 
     data: DataArgs = field(default_factory=DataArgs)
     optim: OptimArgs = field(default_factory=OptimArgs)
@@ -249,15 +257,18 @@ def train(args: TrainArgs):
 
         torch.manual_seed(args.seed)
         logger.info("Building model")
-
+        lingua.transformer._WSPARSIFY1=args.model.wsparsify1
+        lingua.transformer._WSPARSIFY2=args.model.wsparsify2
+        lingua.transformer._ACTIVATION_SPARSE=args.model.activation_sparsify
         # Initializing Model in meta device allows us to initialize models much bigger than 1 gpu's memory
+        
         with torch.device("meta"):
             model = LMTransformer(args.model)
         logger.info("Model is built !")
 
         model_param_count = get_num_params(model)
 
-        model = parallelize_model(
+        model, fsdp_group_plan = parallelize_model(
             model,
             world_mesh,
             args.model,
@@ -266,10 +277,14 @@ def train(args: TrainArgs):
             tp_parallelize=tp_parallelize,
             no_recompute_ops=get_no_recompute_ops(),
         )
+        
 
         # Once we shard the model on different gpus we can actually initialize the model
         # First we create empty tensors of the correct shapes
+
         model = model.to_empty(device="cuda")
+        
+        #scaler = torch.cuda.amp.GradScaler(enabled=True)
         # Then we init the model. Please make sure this function initializes *ALL* parameters
         # and buffers, otherwise you will have random values in the unitialized tensors
         # which will silently fail (give nan gradients for example)
@@ -281,6 +296,7 @@ def train(args: TrainArgs):
         else:
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 torch.manual_seed(args.model.seed)
+                #model.rope_embeddings.reset_parameters() # For RoPe initialization since it's a buffer it might not be loaded
                 model.init_weights()
         check_model_value_range(model, range=10.0, std=1.0)
 
@@ -311,6 +327,7 @@ def train(args: TrainArgs):
         checkpoint = CheckpointManager.instantiate_and_make_dir(args.checkpoint)
         checkpoint.load(model, optimizer, train_state, world_mesh)
         # Either load from latest checkpoint or start from scratch
+        '''
         if args.probe_freq is not None:
             if get_is_master():
                 os.makedirs(Path(args.dump_dir) / "probe", exist_ok=True)
@@ -323,6 +340,7 @@ def train(args: TrainArgs):
                     else None
                 ),
             )
+        '''
 
         gc.disable()
 
@@ -343,12 +361,17 @@ def train(args: TrainArgs):
 
         nwords_since_last_log = 0
         time_last_log = timer()
+
         gc.collect()
+        
         while train_state.step < args.steps:
             # We constrain train_state.acc_step to be in range 0 to args.grad_acc_steps - 1
             train_state.acc_step += 1
             train_state.acc_step = train_state.acc_step % args.grad_acc_steps
-
+            # for g in optimizer.param_groups:
+            #     #print(g, flush=True)
+            #     g['lr'] = 0
+     
             # get batch
             curr_lr = float(optimizer.param_groups[0]["lr"])
             data_load_start = timer()
@@ -357,11 +380,12 @@ def train(args: TrainArgs):
                 batch,
                 dtype=torch.long,
             )
-
+            saved=False
             if every_n_steps(train_state, args.gc_collect_freq, acc_step=0):
                 logger.info("garbage collection")
                 # we do garbage collection manually otherwise different processes
                 # run the GC at different times so they slow down the whole pipeline
+
                 gc.collect()
 
             input_ids = batch[:, :, 0].cuda()
@@ -376,43 +400,8 @@ def train(args: TrainArgs):
             end_timer = torch.cuda.Event(enable_timing=True)
             start_timer.record()
 
-            # This is an automatic probe that will compute statistics
-            # of all linears' inputs, weights and outputs
-            # along with attention logits and entropy
-            # both in forward and backward pass
-            if (args.probe_freq is not None) and every_n_steps(
-                train_state, args.probe_freq, acc_step=1 % args.grad_acc_steps
-            ):
-                # Here we do a fake forward and backward pass on a smaller
-                # batch size to avoid OOM
-                # This assumes the model has no stateful layers (batch norm..)
-                assert (
-                    next(model.parameters()).grad is None
-                ), "Can't probe model if grads are not reset"
-
-                with probe:
-                    probe.metadata = {
-                        "it": train_state.step,
-                        "global_step": train_state.step,
-                        "loop": "lingua",
-                    }
-                    # Non compiled model uses roughly 2x memory in our exps
-                    # So we divide bsz by 2 or seqlen by 2
-                    probe_bsz = max(1, bsz // 2)
-                    probe_seq = seqlen if (bsz // 2 >= 1) else (seqlen // 2)
-                    probe_loss = model(
-                        input_ids[:probe_bsz, :probe_seq],
-                        labels[:probe_bsz, :probe_seq],
-                    )
-                    probe_loss.backward()
-                    # We zero grads to cancel this fake step
-                    optimizer.zero_grad()
-
-                assert (
-                    next(model.parameters()).grad is None
-                ), "Probe model shouldn't have grads at this point"
-
             loss = model(input_ids, labels)
+           
 
             if args.grad_acc_steps > 1:
                 model.set_requires_gradient_sync(train_state.acc_step == 0)
@@ -422,11 +411,14 @@ def train(args: TrainArgs):
             loss = loss / args.grad_acc_steps
             # backward on scaled loss to create scaled gradients
             loss.backward()
-            # For logging we undo that scaling
+    
             loss = loss.detach() * args.grad_acc_steps
-
+  
+        
             # optimizer step
             grad_norm = -1.0
+            #if args.optim.clip != 0:
+            #    scaler.unscale_(optimizer)
             if train_state.acc_step == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=args.optim.clip, foreach=True
@@ -436,8 +428,13 @@ def train(args: TrainArgs):
                     grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
                 ).item()
 
+                # for param in model.parameters():
+                #     if param.grad is not None:
+                #         print('param: grad ', param.grad, flush=True )
                 optimizer.step()
+                #scaler.step(optimizer)
                 scheduler.step()
+                #scaler.update()
                 optimizer.zero_grad()
                 train_state.step += 1
 
@@ -472,6 +469,7 @@ def train(args: TrainArgs):
                     total_acc_steps * args.data.batch_size * args.data.seq_len
                 )
                 total_tokens = dp_degree * tokens_per_gpu
+
                 # This is an estimate and the correct values may change
                 # if you change the architecture
                 # Use xformer's analyze profile trace to get actual measurement
@@ -526,12 +524,15 @@ def train(args: TrainArgs):
                     f"  lr: {curr_lr:.2e}"
                     f"  mem: {gpu_mem_stats.max_active_pct:.0f}%"
                     f"  pow: {gpu_mem_stats.power_draw/1000} W"
+                    f"  tokens per gpu: {tokens_per_gpu}"
+                    f"  total tokens: {total_tokens}"
                 )
 
             saved = False
             if every_n_steps(
                 train_state, args.checkpoint.dump.every, acc_step=0
-            ) or every_n_steps(train_state, args.checkpoint.eval.every, acc_step=0):
+            ) or every_n_steps(train_state, args.checkpoint.eval.every,
+                    acc_step=0):
                 saved = checkpoint.save(
                     model,
                     optimizer,
@@ -542,7 +543,7 @@ def train(args: TrainArgs):
 
             if args.eval is not None and every_n_steps(
                 train_state, args.checkpoint.eval.every, acc_step=0
-            ):
+            ): 
                 from apps.main.eval import (
                     launch_eval,
                     EVAL_FOLDER_NAME,
@@ -560,6 +561,9 @@ def train(args: TrainArgs):
                         EVAL_FOLDER_NAME.format(train_state.step),
                     )
                 )
+                eval_args._WSPARSIFY1 = lingua.transformer._WSPARSIFY1
+                eval_args._WSPARSIFY2 = lingua.transformer._WSPARSIFY2
+                eval_args._24_WARMUP = lingua.transformer._24_WARMUP
                 eval_args.metric_log_dir = args.dump_dir
                 if args.async_eval_gpus is None:
                     launch_eval(eval_args)
@@ -575,7 +579,8 @@ def train(args: TrainArgs):
                                 script="apps.main.eval",
                                 copy_code=False,
                                 nodes=args.async_eval_gpus // 8,
-                                qos="lowest",
+                                account="atom",
+                                qos="atom_high",
                             )
                         )
 
@@ -587,10 +592,13 @@ def train(args: TrainArgs):
                         train_state,
                         args,
                         device_mesh=world_mesh,
+                        sparsify_weights = ['w1'],
+                        num_layers = args.model.n_layers
+
                     )
                 requeue_slurm_job()
                 sys.exit(0)
-
+    saved=False
     if not saved:
         checkpoint.save(
             model,
@@ -598,6 +606,8 @@ def train(args: TrainArgs):
             train_state,
             args,
             device_mesh=world_mesh,
+            sparsify_weights = ['w1'],
+            num_layers=args.model.n_layers
         )
     gc.collect()
 

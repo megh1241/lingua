@@ -15,6 +15,7 @@ from torch.distributed.checkpoint import FileSystemReader
 import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.distributed._tensor import DeviceMesh
+from sparse import matmul, MVUE24_approx_triton, soft_threshold24_triton
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -98,7 +99,6 @@ def load_from_checkpoint(ckpt_dir: str, model: nn.Module, optimizer: Optional[to
         state_dict[model_key] = get_model_state_dict(model)
         if model_key == "": # If only loading a model directly, the key should be empty
             state_dict = state_dict.pop(model_key)
-    
     dcp.load(state_dict, checkpoint_id=ckpt_dir)
 
 class CheckpointManager:
@@ -214,6 +214,8 @@ class CheckpointManager:
         train_state,
         config,
         device_mesh: Optional[DeviceMesh] = None,
+        sparsify_weights: Optional[List] = None,
+        num_layers: Optional[int] = None
     ) -> bool:
 
         # When creating directory check if only rank0 or is there other solution
@@ -226,9 +228,23 @@ class CheckpointManager:
 
         logger.info("Saving...")
         state_dict = self.get_state_dict(model, optimizer)
-        dcp.save(state_dict, checkpoint_id=curr_save_dir)
-        logger.info("State dict saved!")
+        if sparsify_weights:
+            print('num layers: ', num_layers, flush=True)
+            for i in range(num_layers):
+                for ch in sparsify_weights:
+                    ch_num = ch[-1]
+                    name = f"layers.{i}.feed_forward.{ch}.weight"
+                    param = state_dict['model'][name].full_tensor()
+                    weight_sparse, _ = soft_threshold24_triton(param)
+                    scale_name = f"layers.{i}.feed_forward.scale{ch_num}"
+                    scale = state_dict['model'][scale_name]
+                    #Save the 2:4 scaled sparse weights so that we when dense-finetuning we start with the same weights
+                    weight_sparse = weight_sparse * scale
+                    state_dict['model'][name] = weight_sparse
+               
 
+        dcp.save(state_dict, checkpoint_id=curr_save_dir)
+        
         if dist.is_initialized():
             dist.barrier()
 
@@ -282,12 +298,12 @@ class CheckpointManager:
             train_state_dict = json.load(f)
         train_state.load_state_dict(train_state_dict)
         logger.info("Train state reloaded")
-
         logger.info(f"Loading from: {str(path)}")
         state_dict = self.get_state_dict(
             model=model,
             optimizer=optimizer,
         )
+
         dcp.load(state_dict, checkpoint_id=path)
         logger.info("State dict loaded.")
 

@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from functools import lru_cache, partial, reduce
 from typing import List, Optional, Tuple, Union
-
+import enum
 import torch
 from torch.distributed import ReduceOp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -26,10 +26,16 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.utils.checkpoint import (
-    create_selective_checkpoint_contexts,
-    CheckpointPolicy,
-)
+#from torch.utils.checkpoint import (
+#    create_selective_checkpoint_contexts,
+#    CheckpointPolicy,
+#)
+
+try:
+    from torch.utils.checkpoint import CheckpointPolicy
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+except Exception:
+    pass
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 # for no recompute ops
@@ -47,8 +53,37 @@ default_no_recompute_ops = {
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops.c10d_functional.reduce_scatter_tensor.default,
     torch.ops.xformers_flash.flash_fwd.default,
-    torch.ops.xformers.efficient_attention_forward_cutlass.default,
+    #torch.ops.xformers.efficient_attention_forward_cutlass.default,
 }
+
+
+class CheckpointPolicy(enum.Enum):
+    """
+    Enum for specifying the policy for checkpointing during backpropagation.
+
+    The following policies are supported:
+
+    - ``{MUST,PREFER}_SAVE``: The operation's output will be saved during the forward
+      pass and will not be recomputed during the backward pass
+    - ``{MUST,PREFER}_RECOMPUTE``: The operation's output will not be saved during the
+      forward pass and will be recomputed during the backward pass
+
+    Use ``MUST_*`` over ``PREFER_*`` to indicate that the policy should not be overridden
+    by other subsystems like `torch.compile`.
+
+    .. note::
+        A policy function that always returns ``PREFER_RECOMPUTE`` is
+        equivalent to vanilla checkpointing.
+
+        A policy function that returns ``PREFER_SAVE`` every op is
+        NOT equivalent to not using checkpointing. Using such a policy would
+        save additional tensors not limited to ones that are actually needed for
+        gradient computation.
+    """
+    MUST_SAVE = 0
+    PREFER_SAVE = 1
+    MUST_RECOMPUTE = 2
+    PREFER_RECOMPUTE = 3
 
 
 @dataclass
@@ -61,7 +96,7 @@ class DistributedArgs:
     )
     tp_size: int = 1
     selective_activation_checkpointing: bool = False
-    compile: bool = False
+    compile: bool = True
     fsdp_type: str = "no_shard"
     model_dtype: str = "bf16"
     float8_recipe: Optional[str] = None
@@ -450,11 +485,13 @@ def parallelize_model(
                 model,
                 path,
                 fully_shard(
-                    module, **fsdp_config, reshard_after_forward=reshard_after_forward
+                    #module, **fsdp_config, reshard_after_forward=reshard_after_forward
+                    module, **fsdp_config, reshard_after_forward=False
                 ),
             )
 
-        model = fully_shard(model, **fsdp_config, reshard_after_forward=True)
+        #model = fully_shard(model, **fsdp_config, reshard_after_forward=True)
+        model = fully_shard(model, **fsdp_config, reshard_after_forward=False)
     else:
         raise ValueError(f"Invalid fsdp_type: {distributed_args.fsdp_type}")
 
@@ -473,4 +510,5 @@ def parallelize_model(
         )
         model.compile()
 
-    return model
+    return model, fsdp_grouping_plan
+#Note: commented out compile, reshard after forward commented out

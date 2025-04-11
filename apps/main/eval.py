@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import json
 import logging
+import numpy as np
 import os
 from pathlib import Path
 from lm_eval.api.instance import Instance
@@ -12,6 +13,7 @@ from lm_eval.api.model import LM
 from typing import Any, List, Optional, Tuple, Union
 from lm_eval import simple_evaluate
 from omegaconf import OmegaConf
+import lingua.transformer
 import torch
 from apps.main.generate import (
     PackedCausalTransformerGenerator,
@@ -34,6 +36,16 @@ EVAL_FOLDER_NAME = "{:010d}"
 
 logger = logging.getLogger()
 
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
 @dataclass
 class LMHarnessArgs:
@@ -243,8 +255,12 @@ def launch_eval(cfg: EvalArgs):
     )
     logger.info("Model loaded")
     model.eval()
-    generator = PackedCausalTransformerGenerator(cfg.generator, model, tokenizer)
+    lingua.transformer._WSPARSIFY1 = False
+    lingua.transformer._WSPARSIFY2 = False
+    lingua.transformer._24_WARMUP = False
+    lingua.transformer._ACTIVATION_SPARSE = False
 
+    generator = PackedCausalTransformerGenerator(cfg.generator, model, tokenizer)
     wrap = EvalHarnessLM(generator)
     results = simple_evaluate(wrap, **asdict(cfg.harness))
     val_results =  None
@@ -252,11 +268,11 @@ def launch_eval(cfg: EvalArgs):
         val_results = eval_on_val(generator, cfg.validation, train_cfg)
     if get_global_rank() == 0:
         with open(Path(cfg.dump_dir) / "results.json", "w") as f:
-            f.write(json.dumps(results))
+            f.write(json.dumps(results, cls=NpEncoder))
         logger.info(f"All evaluation results: {results['results']}")
         if val_results is not None:
             with open(Path(cfg.dump_dir) / "validation.json", "w") as f:
-                f.write(json.dumps(val_results))
+                f.write(json.dumps(val_results, cls=NpEncoder))
             logger.info(f"All validation results: {val_results}")
     if cfg.metric_log_dir and get_global_rank() == 0:
         metric_log_path = Path(cfg.metric_log_dir) / "metrics.eval.jsonl"
@@ -268,7 +284,7 @@ def launch_eval(cfg: EvalArgs):
         if cfg.global_step is not None:
             timestamp["global_step"] = cfg.global_step
         print(
-            json.dumps(timestamp | results["results"]),
+            json.dumps(timestamp | results["results"], cls=NpEncoder),
             file=open(metric_log_path, mode="a"),
             flush=True,
         )

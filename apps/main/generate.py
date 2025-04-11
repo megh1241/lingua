@@ -180,7 +180,8 @@ class PackedCausalTransformerGenerator:
         )
 
         self.show_progress = cfg.show_progress
-        self.dtype = dict(fp32=torch.float32, bf16=torch.bfloat16)[cfg.dtype]
+        self.dtype = dict(fp32=torch.float32, bf16=torch.bfloat16,
+                fp16=torch.float16)[cfg.dtype]
 
         self.prefill_doc_id, self.prefill_tok_id = None, None
         self.padded_doc_id, self.padded_tok_id = None, None

@@ -24,7 +24,7 @@ class StoolArgs:
     override: bool = False  # Wether to delete dump dir and restart
     nodes: int = -1  # The number of nodes to run the job on.
     ngpu: int = 8  # The number of GPUs required per node.
-    ncpu: int = 16  # The number of CPUs allocated per GPU.
+    ncpu: int = 4  # The number of CPUs allocated per GPU.
     mem: str = ""  # The amount of memory to allocate.
     anaconda: str = "default"  # The path to the anaconda environment.
     constraint: str = ""  # The constraint on the nodes.
@@ -44,11 +44,10 @@ SBATCH_COMMAND = """#!/bin/bash
 {constraint}
 #SBATCH --job-name={name}
 #SBATCH --nodes={nodes}
+#SBATCH --cpus-per-task=4
+#SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:{ngpus}
-#SBATCH --cpus-per-gpu={ncpu}
 #SBATCH --time={time}
-#SBATCH --partition={partition}
-#SBATCH --mem={mem}
 
 #SBATCH --output={dump_dir}/logs/%j/%j.stdout
 #SBATCH --error={dump_dir}/logs/%j/%j.stderr
@@ -66,6 +65,10 @@ source activate {conda_env_path}
 export OMP_NUM_THREADS=1
 export LAUNCH_WITH="SBATCH"
 export DUMP_DIR={dump_dir}
+export PYTHONIOENCODING="UTF-8"
+export LD_PRELOAD=/usr/local/cuda-12.4/lib/libnccl.so
+export LD_LIBRARY_PATH=/opt/aws-ofi-nccl/lib/:$LD_LIBRARY_PATH
+export NCCL_DEBUG=info
 srun {log_output} -n {tasks} -N {nodes_per_run} python -u -m {script} config=$DUMP_DIR/base_config.yaml
 """
 
