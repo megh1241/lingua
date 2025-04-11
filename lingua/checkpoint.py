@@ -229,7 +229,6 @@ class CheckpointManager:
         logger.info("Saving...")
         state_dict = self.get_state_dict(model, optimizer)
         if sparsify_weights:
-            print('num layers: ', num_layers, flush=True)
             for i in range(num_layers):
                 for ch in sparsify_weights:
                     ch_num = ch[-1]
